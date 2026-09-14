@@ -184,9 +184,23 @@ auth.users ──1:1── profiles
 ### 4.2 Migration `0001_core.sql`
 
 ```sql
+-- ============================================================================
+-- Rueang · 0001_core.sql
+-- แกนกลาง: profiles / topics / entries / link_previews / entry_links / attachments
+-- ห้ามใส่อะไรที่เจาะจงเรื่อง "เที่ยว" ในไฟล์นี้ (ยกเว้นสวิตช์ is_travel_enabled)
+-- ============================================================================
+
 create extension if not exists "pgcrypto";
 create extension if not exists "pg_trgm";
 create extension if not exists "unaccent";
+
+-- ── helper: updated_at ──────────────────────────────────────────────────────
+create or replace function set_updated_at() returns trigger
+language plpgsql as $$
+begin
+  new.updated_at := now();
+  return new;
+end $$;
 
 -- ── profiles ────────────────────────────────────────────────────────────────
 create table profiles (
@@ -197,28 +211,48 @@ create table profiles (
   created_at   timestamptz not null default now()
 );
 
+-- สร้าง profile อัตโนมัติเมื่อมี user ใหม่
+create or replace function handle_new_user() returns trigger
+language plpgsql security definer set search_path = public as $$
+begin
+  insert into public.profiles (id, display_name, avatar_url)
+  values (
+    new.id,
+    coalesce(new.raw_user_meta_data ->> 'full_name', split_part(new.email, '@', 1)),
+    new.raw_user_meta_data ->> 'avatar_url'
+  )
+  on conflict (id) do nothing;
+  return new;
+end $$;
+
+create trigger on_auth_user_created
+  after insert on auth.users
+  for each row execute function handle_new_user();
+
 -- ── topics (เรื่อง) ─────────────────────────────────────────────────────────
-create type topic_status as enum ('active','archived');
+do $$ begin
+  create type topic_status as enum ('active','archived');
+exception when duplicate_object then null; end $$;
 
 create table topics (
   id          uuid primary key default gen_random_uuid(),
   owner_id    uuid not null references auth.users(id) on delete cascade,
 
   title       text not null check (char_length(trim(title)) between 1 and 200),
-  description text check (char_length(description) <= 2000),
+  description text check (description is null or char_length(description) <= 2000),
   tags        text[] not null default '{}',
   color       text check (color is null or color ~ '^#[0-9a-fA-F]{6}$'),
   status      topic_status not null default 'active',
 
-  -- travel kit switch (สวิตช์เท่านั้น ข้อมูลทริปอยู่ตาราง trips)
-  is_travel_enabled            boolean not null default false,
-  travel_suggestion_dismissed  boolean not null default false,
+  -- สวิตช์ของ travel kit (ข้อมูลทริปจริงอยู่ตาราง trips ใน 0002)
+  is_travel_enabled           boolean not null default false,
+  travel_suggestion_dismissed boolean not null default false,
 
   -- public share
   is_public   boolean not null default false,
   share_slug  text unique check (share_slug is null or share_slug ~ '^[a-z0-9]{12,24}$'),
 
-  -- denormalized counters (อัปเดตด้วย trigger)
+  -- counters (ดูแลโดย trigger ท้ายไฟล์)
   entry_count   integer not null default 0 check (entry_count >= 0),
   last_entry_at timestamptz,
 
@@ -226,16 +260,21 @@ create table topics (
   updated_at  timestamptz not null default now(),
   deleted_at  timestamptz,
 
-  -- แชร์สาธารณะได้ต้องมี slug เสมอ
   constraint public_topic_needs_slug check (not is_public or share_slug is not null)
 );
 
 create index topics_owner_active_idx on topics (owner_id, last_entry_at desc nulls last)
   where deleted_at is null;
-create index topics_tags_idx  on topics using gin (tags);
-create index topics_title_trgm_idx on topics using gin (title gin_trgm_ops);
+create index topics_share_slug_idx  on topics (share_slug) where is_public and deleted_at is null;
+create index topics_tags_idx        on topics using gin (tags);
+create index topics_title_trgm_idx  on topics using gin (title gin_trgm_ops);
+
+create trigger topics_set_updated_at before update on topics
+  for each row execute function set_updated_at();
 
 -- ── entries ─────────────────────────────────────────────────────────────────
+-- entry ไม่มี "ชนิด": body ว่างได้ + มีลิงก์/ไฟล์กี่อันก็ได้
+-- ข้อบังคับ "ต้องมีอย่างน้อย 1 อย่าง" เช็คข้าม 3 ตาราง → บังคับที่ Zod ชั้น service
 create table entries (
   id         uuid primary key default gen_random_uuid(),
   topic_id   uuid not null references topics(id) on delete cascade,
@@ -243,47 +282,57 @@ create table entries (
 
   title      text check (title is null or char_length(title) <= 300),
   body       text check (body  is null or char_length(body)  <= 20000),
-  sort_order double precision not null default 0,
 
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   deleted_at timestamptz
 );
 
-create index entries_topic_idx on entries (topic_id, sort_order, created_at desc)
-  where deleted_at is null;
-create index entries_body_trgm_idx on entries using gin (body gin_trgm_ops);
+create index entries_topic_idx      on entries (topic_id, created_at desc) where deleted_at is null;
+create index entries_owner_idx      on entries (owner_id) where deleted_at is null;
+create index entries_body_trgm_idx  on entries using gin (body gin_trgm_ops);
+create index entries_title_trgm_idx on entries using gin (title gin_trgm_ops);
 
--- ── link_previews (cache กลาง ใช้ร่วมกันทุก user) ────────────────────────────
-create type link_preview_status as enum ('pending','ready','failed');
+create trigger entries_set_updated_at before update on entries
+  for each row execute function set_updated_at();
+
+-- ── link_previews (cache กลาง ใช้ร่วมกันทุก user, ไม่มีข้อมูลส่วนตัว) ────────
+do $$ begin
+  create type link_preview_status as enum ('pending','ready','failed');
+exception when duplicate_object then null; end $$;
 
 create table link_previews (
-  url_hash       text primary key,              -- sha256 ของ normalized url
+  url_hash       text primary key check (url_hash ~ '^[0-9a-f]{64}$'),  -- sha256 ของ normalized url
   url            text not null,
-  provider       text,                          -- tiktok | youtube | instagram | generic
+  provider       text,                       -- tiktok | youtube | instagram | generic
   title          text,
   description    text,
   image_url      text,
   author_name    text,
   status         link_preview_status not null default 'pending',
   error_reason   text,
-  fetch_attempts integer not null default 0,
+  fetch_attempts integer not null default 0 check (fetch_attempts >= 0),
   fetched_at     timestamptz,
-  expires_at     timestamptz
+  expires_at     timestamptz,
+  created_at     timestamptz not null default now()
 );
 
+create index link_previews_stale_idx on link_previews (expires_at) where status = 'ready';
+
 -- ── entry_links ─────────────────────────────────────────────────────────────
+-- FK ไป link_previews แบบ restrict → ต้อง upsert link_previews (pending) ก่อนเสมอ
 create table entry_links (
   id         uuid primary key default gen_random_uuid(),
   entry_id   uuid not null references entries(id) on delete cascade,
   owner_id   uuid not null references auth.users(id) on delete cascade,
   url        text not null check (url ~ '^https?://'),
   url_hash   text not null references link_previews(url_hash) on delete restrict,
-  position   integer not null default 0,
+  position   integer not null default 0 check (position >= 0),
   created_at timestamptz not null default now()
 );
 
 create index entry_links_entry_idx on entry_links (entry_id, position);
+create index entry_links_hash_idx  on entry_links (url_hash);
 
 -- ── attachments ─────────────────────────────────────────────────────────────
 create table attachments (
@@ -293,20 +342,61 @@ create table attachments (
   owner_id      uuid not null references auth.users(id) on delete cascade,
 
   storage_path  text not null unique,
-  original_name text not null check (char_length(original_name) <= 255),
+  original_name text not null check (char_length(original_name) between 1 and 255),
   mime_type     text not null,
-  size_bytes    bigint not null check (size_bytes > 0 and size_bytes <= 26214400), -- 25MB
+  size_bytes    bigint not null check (size_bytes > 0 and size_bytes <= 26214400), -- 25 MB
   checksum      text,
-  width         integer,
-  height        integer,
+  width         integer check (width  is null or width  > 0),
+  height        integer check (height is null or height > 0),
   created_at    timestamptz not null default now()
 );
 
 create index attachments_entry_idx on attachments (entry_id);
 create index attachments_topic_idx on attachments (topic_id);
+
+-- ── counters: entry_count / last_entry_at ───────────────────────────────────
+-- นับใหม่ทั้งหมดทุกครั้ง (self-healing) — จำนวน entry ต่อเรื่องน้อย ความถูกต้องสำคัญกว่า
+create or replace function sync_topic_entry_stats() returns trigger
+language plpgsql security definer set search_path = public as $$
+declare
+  touched  uuid[] := '{}';
+  distinct_ids uuid[];
+  tid uuid;
+begin
+  -- ต้องนับใหม่ "ทั้งเรื่องต้นทางและปลายทาง" ไม่งั้นตอนย้าย entry ข้ามเรื่อง
+  -- เรื่องเดิมจะค้างตัวเลขเก่าไว้ตลอดกาล
+  if TG_OP <> 'INSERT' then touched := touched || old.topic_id; end if;
+  if TG_OP <> 'DELETE' then touched := touched || new.topic_id; end if;
+
+  select array_agg(distinct v) into distinct_ids from unnest(touched) v;
+  if distinct_ids is null then return null; end if;
+
+  foreach tid in array distinct_ids loop
+    update topics t
+       set entry_count   = (select count(*)          from entries e
+                             where e.topic_id = tid and e.deleted_at is null),
+           last_entry_at = (select max(e.created_at) from entries e
+                             where e.topic_id = tid and e.deleted_at is null)
+     where t.id = tid;
+  end loop;
+  return null;
+end $$;
+
+create trigger entries_sync_stats
+  after insert or update of deleted_at, topic_id or delete on entries
+  for each row execute function sync_topic_entry_stats();
 ```
 
-**ลำดับการเขียนที่ FK บังคับไว้:** `entry_links.url_hash` อ้าง `link_previews(url_hash)` แบบ `on delete restrict` แปลว่า **ต้อง upsert แถว `link_previews` (status `pending`) ให้เสร็จก่อน** แล้วค่อย insert `entry_links` เสมอ — ทำสองอย่างนี้ใน transaction เดียวใน server action `createEntry` และห้ามลบแถว `link_previews` ที่ยังมีคนอ้างอยู่
+**ลำดับการเขียนที่ FK บังคับไว้:** `entry_links.url_hash` อ้าง `link_previews(url_hash)` แบบ `on delete restrict` แปลว่า **ต้อง upsert แถว `link_previews` (status `pending`) ให้เสร็จก่อน** แล้วค่อย insert `entry_links` เสมอ
+
+⚠️ **`link_previews` เขียนด้วย client ของผู้ใช้ไม่ได้** — ตารางนี้ไม่มี RLS policy สำหรับ insert/update ให้ `authenticated` (ยืนยันด้วยเทส R9 ใน `supabase/tests/02_rls.sql`) ดังนั้นใน `createEntry` ต้องทำสองจังหวะ:
+
+1. upsert `link_previews` ผ่าน **admin client (service role)** — แถวนี้เป็น metadata สาธารณะ ไม่มีข้อมูลส่วนตัว
+2. insert `entries` + `entry_links` ผ่าน **client ของผู้ใช้** ให้ RLS ทำงานตามปกติ
+
+**ทำไมไม่เปิดให้ผู้ใช้เขียนเอง:** cache นี้ใช้ร่วมกันทุกคน ถ้าผู้ใช้ insert คู่ `url_hash`/`url` ที่ไม่ตรงกันได้ จะกลายเป็น cache poisoning ที่ผู้ใช้คนอื่นเห็น preview ผิด
+
+สองจังหวะนี้ไม่ atomic (คนละ client) แต่ปลอดภัย — ถ้าจังหวะ 2 พัง จะเหลือแถว `pending` กำพร้าซึ่งไม่มีผลอะไร และห้ามลบแถว `link_previews` ที่ยังมีคนอ้างอยู่
 
 **หมายเหตุ constraint ที่บังคับใน DB ไม่ได้:**
 `entry` ต้องมีอย่างน้อยหนึ่งอย่าง (body / link / file) — เช็คข้าม 3 ตารางใน `CHECK` ไม่ได้ จึงบังคับที่ **Zod schema ในชั้น service** (`createEntrySchema.refine(...)`) และมี unit test คุมไว้ ห้าม insert entry เปล่าผ่านทางอื่น
@@ -314,6 +404,13 @@ create index attachments_topic_idx on attachments (topic_id);
 ### 4.3 Migration `0002_travel_kit.sql`
 
 ```sql
+-- ============================================================================
+-- Rueang · 0002_travel_kit.sql
+-- KIT: Travel — เสียบเพิ่มบน core, opt-in ต่อเรื่อง
+-- กฎ: kit อ้าง core ได้ / core ห้ามอ้าง kit
+-- ปิดโหมด = topics.is_travel_enabled = false เท่านั้น "ห้ามลบแถวในไฟล์นี้"
+-- ============================================================================
+
 create table trips (
   topic_id          uuid primary key references topics(id) on delete cascade,
   owner_id          uuid not null references auth.users(id) on delete cascade,
@@ -328,25 +425,36 @@ create table trips (
   constraint trip_date_order check (start_date is null or end_date is null or end_date >= start_date)
 );
 
+create trigger trips_set_updated_at before update on trips
+  for each row execute function set_updated_at();
+
 create table trip_days (
   id         uuid primary key default gen_random_uuid(),
   topic_id   uuid not null references trips(topic_id) on delete cascade,
   owner_id   uuid not null references auth.users(id) on delete cascade,
-  day_index  integer not null check (day_index >= 1),
+  day_index  integer not null check (day_index between 1 and 366),
   date       date,
-  title      text,
+  title      text check (title is null or char_length(title) <= 200),
   note       text,
+  created_at timestamptz not null default now(),
   unique (topic_id, day_index)
 );
 
-create type stop_status as enum ('planned','confirmed','skipped','done');
+create index trip_days_topic_idx on trip_days (topic_id, day_index);
+
+do $$ begin
+  create type stop_status as enum ('planned','confirmed','skipped','done');
+exception when duplicate_object then null; end $$;
 
 create table trip_stops (
   id               uuid primary key default gen_random_uuid(),
   topic_id         uuid not null references trips(topic_id) on delete cascade,
   owner_id         uuid not null references auth.users(id) on delete cascade,
-  day_id           uuid references trip_days(id) on delete set null,  -- null = "กองรอจัด"
-  entry_id         uuid references entries(id) on delete set null,     -- ที่มาของ stop นี้
+  -- day_id = null → "กองรอจัด" (เก็บไว้แล้วแต่ยังไม่รู้จะไปวันไหน)
+  day_id           uuid references trip_days(id) on delete set null,
+  -- entry ต้นทาง: ลบ entry แล้ว stop ต้องยังอยู่ แค่ปุ่ม "ที่มา" หายไป
+  entry_id         uuid references entries(id) on delete set null,
+
   name             text not null check (char_length(trim(name)) between 1 and 200),
   note             text,
   planned_start    time,
@@ -354,30 +462,43 @@ create table trip_stops (
   est_cost         numeric(12,2) check (est_cost is null or est_cost >= 0),
   status           stop_status not null default 'planned',
   sort_order       double precision not null default 0,
-  created_at       timestamptz not null default now()
+  created_at       timestamptz not null default now(),
+  updated_at       timestamptz not null default now()
 );
 
-create index trip_stops_day_idx on trip_stops (topic_id, day_id, sort_order);
+create index trip_stops_day_idx     on trip_stops (topic_id, day_id, sort_order);
+create index trip_stops_backlog_idx on trip_stops (topic_id, sort_order) where day_id is null;
+create index trip_stops_entry_idx   on trip_stops (entry_id);
+
+create trigger trip_stops_set_updated_at before update on trip_stops
+  for each row execute function set_updated_at();
 
 create table checklist_items (
   id         uuid primary key default gen_random_uuid(),
   topic_id   uuid not null references trips(topic_id) on delete cascade,
   owner_id   uuid not null references auth.users(id) on delete cascade,
   label      text not null check (char_length(trim(label)) between 1 and 200),
-  category   text,
+  category   text check (category is null or char_length(category) <= 50),
   is_done    boolean not null default false,
-  sort_order double precision not null default 0
+  sort_order double precision not null default 0,
+  created_at timestamptz not null default now()
 );
 
+create index checklist_items_topic_idx on checklist_items (topic_id, sort_order);
+
 create table budget_items (
-  id       uuid primary key default gen_random_uuid(),
-  topic_id uuid not null references trips(topic_id) on delete cascade,
-  owner_id uuid not null references auth.users(id) on delete cascade,
-  label    text not null check (char_length(trim(label)) between 1 and 200),
-  category text check (category is null or category in ('transport','stay','food','activity','shopping','other')),
-  amount   numeric(12,2) not null check (amount >= 0),
-  is_paid  boolean not null default false
+  id         uuid primary key default gen_random_uuid(),
+  topic_id   uuid not null references trips(topic_id) on delete cascade,
+  owner_id   uuid not null references auth.users(id) on delete cascade,
+  label      text not null check (char_length(trim(label)) between 1 and 200),
+  category   text check (category is null or category in
+                ('transport','stay','food','activity','shopping','other')),
+  amount     numeric(12,2) not null check (amount >= 0),
+  is_paid    boolean not null default false,
+  created_at timestamptz not null default now()
 );
+
+create index budget_items_topic_idx on budget_items (topic_id);
 ```
 
 **ทำไม `owner_id` ซ้ำอยู่ทุกตาราง:** เพื่อให้ RLS policy เป็น `owner_id = auth.uid()` ตรงๆ ไม่ต้อง `EXISTS` ไล่ join กลับไป `topics` ทุก query — เร็วกว่าและอ่านง่ายกว่ามาก ราคาที่จ่ายคือต้องมี trigger กันการเซ็ตผิดเจ้าของ (อยู่ใน `0003_rls.sql`)
@@ -399,6 +520,18 @@ create table budget_items (
 ### 5.2 Migration `0003_rls.sql`
 
 ```sql
+-- ============================================================================
+-- Rueang · 0003_rls.sql
+-- Row Level Security — deny by default
+--
+-- กฎเหล็ก 2 ข้อของไฟล์นี้ (ห้ามละเมิด):
+--   1) ห้ามสร้าง policy ให้ role `anon` เด็ดขาด
+--      หน้าแชร์สาธารณะ /s/[slug] render ฝั่ง server ด้วย service role
+--      ถ้าเปิดให้ anon อ่านได้ จะไล่ query หา public topic ของคนอื่นทั้งระบบผ่าน PostgREST
+--   2) ทุกตารางลูกใช้ policy เดียวกันคือ owner_id = auth.uid()
+--      ความถูกต้องของ owner_id ค้ำด้วย trigger enforce_parent_owner() ท้ายไฟล์
+-- ============================================================================
+
 alter table profiles        enable row level security;
 alter table topics          enable row level security;
 alter table entries         enable row level security;
@@ -411,56 +544,173 @@ alter table trip_stops      enable row level security;
 alter table checklist_items enable row level security;
 alter table budget_items    enable row level security;
 
--- profiles: เห็นและแก้ได้เฉพาะของตัวเอง
-create policy profiles_self on profiles
-  for all to authenticated
-  using (id = auth.uid()) with check (id = auth.uid());
+-- ── profiles ────────────────────────────────────────────────────────────────
+create policy profiles_self_select on profiles
+  for select to authenticated using (id = auth.uid());
+create policy profiles_self_update on profiles
+  for update to authenticated using (id = auth.uid()) with check (id = auth.uid());
 
--- topics: เจ้าของเท่านั้น + soft-delete ต้องถูกซ่อน
+-- ── topics ──────────────────────────────────────────────────────────────────
+-- soft-delete ต้องถูกซ่อนตั้งแต่ชั้น DB ไม่ใช่แค่ใน query ของ app
 create policy topics_owner_select on topics
   for select to authenticated using (owner_id = auth.uid() and deleted_at is null);
-create policy topics_owner_write on topics
+create policy topics_owner_insert on topics
   for insert to authenticated with check (owner_id = auth.uid());
 create policy topics_owner_update on topics
-  for update to authenticated
-  using (owner_id = auth.uid()) with check (owner_id = auth.uid());
+  for update to authenticated using (owner_id = auth.uid()) with check (owner_id = auth.uid());
 create policy topics_owner_delete on topics
   for delete to authenticated using (owner_id = auth.uid());
 
--- ตารางลูกทุกตาราง: pattern เดียวกัน (owner_id = auth.uid())
--- entries / entry_links / attachments / trips / trip_days / trip_stops /
--- checklist_items / budget_items ใช้ template นี้:
---
---   create policy <t>_owner on <t> for all to authenticated
---     using (owner_id = auth.uid()) with check (owner_id = auth.uid());
+-- ── entries ─────────────────────────────────────────────────────────────────
+create policy entries_owner_select on entries
+  for select to authenticated using (owner_id = auth.uid() and deleted_at is null);
+create policy entries_owner_insert on entries
+  for insert to authenticated with check (owner_id = auth.uid());
+create policy entries_owner_update on entries
+  for update to authenticated using (owner_id = auth.uid()) with check (owner_id = auth.uid());
+create policy entries_owner_delete on entries
+  for delete to authenticated using (owner_id = auth.uid());
 
--- link_previews: เป็น metadata สาธารณะของเว็บ อ่านได้ทุกคนที่ login
--- เขียนได้เฉพาะ service role (ไม่มี policy for insert/update ให้ authenticated)
+-- ── ตารางลูกที่เหลือ: owner-only ทุก operation ───────────────────────────────
+create policy entry_links_owner on entry_links
+  for all to authenticated using (owner_id = auth.uid()) with check (owner_id = auth.uid());
+create policy attachments_owner on attachments
+  for all to authenticated using (owner_id = auth.uid()) with check (owner_id = auth.uid());
+create policy trips_owner on trips
+  for all to authenticated using (owner_id = auth.uid()) with check (owner_id = auth.uid());
+create policy trip_days_owner on trip_days
+  for all to authenticated using (owner_id = auth.uid()) with check (owner_id = auth.uid());
+create policy trip_stops_owner on trip_stops
+  for all to authenticated using (owner_id = auth.uid()) with check (owner_id = auth.uid());
+create policy checklist_items_owner on checklist_items
+  for all to authenticated using (owner_id = auth.uid()) with check (owner_id = auth.uid());
+create policy budget_items_owner on budget_items
+  for all to authenticated using (owner_id = auth.uid()) with check (owner_id = auth.uid());
+
+-- ── link_previews ───────────────────────────────────────────────────────────
+-- metadata สาธารณะของหน้าเว็บ ไม่มีข้อมูลส่วนตัว → ผู้ใช้ที่ login แล้วอ่านได้ทุกคน
+-- เขียนได้เฉพาะ service role (ตั้งใจไม่ให้ policy insert/update กับ authenticated)
 create policy link_previews_read on link_previews
   for select to authenticated using (true);
-```
 
-**Trigger กันการปลอม owner + กันเด็กกำพร้าข้ามเจ้าของ** (`0003_rls.sql` ต่อ):
+-- ============================================================================
+-- Trigger กันปลอมเจ้าของ / กันผูกข้ามบัญชี
+--
+-- RLS การันตีแค่ว่า "แถวใหม่ owner_id = ตัวเรา" แต่ไม่ได้ห้ามเราสร้าง entry
+-- ที่ topic_id ชี้ไปหาเรื่องของคนอื่น (RLS ไม่ตรวจ FK) — trigger นี้ปิดช่องนั้น
+-- ============================================================================
 
-```sql
--- entry ต้องอยู่ใน topic ของเจ้าของเดียวกันเสมอ
-create or replace function enforce_entry_owner() returns trigger
+create or replace function enforce_parent_owner() returns trigger
 language plpgsql security definer set search_path = public as $$
+declare
+  parent_table   text := TG_ARGV[0];
+  fk_column      text := TG_ARGV[1];
+  parent_pk      text := TG_ARGV[2];
+  require_active boolean := TG_ARGV[3] = '1';
+  fk_value uuid;
+  old_fk   uuid;
+  extra_cond text := '';
+  is_ok boolean;
 begin
-  if not exists (
-    select 1 from topics t
-    where t.id = new.topic_id and t.owner_id = new.owner_id and t.deleted_at is null
-  ) then
-    raise exception 'topic_id ไม่ตรงกับเจ้าของ หรือถูกลบไปแล้ว';
+  fk_value := (to_jsonb(new) ->> fk_column)::uuid;
+  if fk_value is null then
+    return new;                            -- FK ที่ nullable (เช่น day_id, entry_id)
   end if;
+
+  -- ตรวจเฉพาะตอน "ตั้งค่า FK ใหม่" หรือ "ย้าย FK" เท่านั้น
+  -- ถ้าตรวจทุก UPDATE จะพังตอน soft-delete หรือแก้แถวที่ FK ชี้ไปหาของที่ถูก soft-delete ไปแล้ว
+  -- (เช่น แก้ชื่อ trip_stop หลังลบ entry ต้นทาง — ซึ่งดีไซน์ตั้งใจให้ทำได้)
+  if TG_OP = 'UPDATE' then
+    old_fk := (to_jsonb(old) ->> fk_column)::uuid;
+    if old_fk is not distinct from fk_value then
+      return new;
+    end if;
+  end if;
+
+  if require_active then
+    extra_cond := ' and p.deleted_at is null';
+  end if;
+
+  execute format(
+    'select exists (select 1 from %I p where p.%I = $1 and p.owner_id = $2%s)',
+    parent_table, parent_pk, extra_cond
+  ) into is_ok using fk_value, new.owner_id;
+
+  if not is_ok then
+    raise exception '% ที่อ้างถึงไม่มีอยู่ หรือไม่ใช่ของเจ้าของคนเดียวกัน (%=%)',
+      parent_table, fk_column, fk_value
+      using errcode = '42501';
+  end if;
+
   return new;
 end $$;
 
-create trigger entries_owner_guard before insert or update on entries
-  for each row execute function enforce_entry_owner();
-```
+revoke execute on function enforce_parent_owner() from public;
 
-> ทำ trigger แนวเดียวกันให้ `attachments`, `trips`, และตาราง kit ทุกตัว (ดู task P0-6)
+-- core
+create trigger entries_parent_guard      before insert or update on entries
+  for each row execute function enforce_parent_owner('topics','topic_id','id','1');
+create trigger entry_links_parent_guard  before insert or update on entry_links
+  for each row execute function enforce_parent_owner('entries','entry_id','id','1');
+create trigger attachments_topic_guard   before insert or update on attachments
+  for each row execute function enforce_parent_owner('topics','topic_id','id','1');
+create trigger attachments_entry_guard   before insert or update on attachments
+  for each row execute function enforce_parent_owner('entries','entry_id','id','1');
+
+-- travel kit
+create trigger trips_parent_guard          before insert or update on trips
+  for each row execute function enforce_parent_owner('topics','topic_id','id','1');
+create trigger trip_days_parent_guard      before insert or update on trip_days
+  for each row execute function enforce_parent_owner('trips','topic_id','topic_id','0');
+create trigger trip_stops_parent_guard     before insert or update on trip_stops
+  for each row execute function enforce_parent_owner('trips','topic_id','topic_id','0');
+create trigger trip_stops_day_guard        before insert or update on trip_stops
+  for each row execute function enforce_parent_owner('trip_days','day_id','id','0');
+create trigger trip_stops_entry_guard      before insert or update on trip_stops
+  for each row execute function enforce_parent_owner('entries','entry_id','id','1');
+create trigger checklist_items_parent_guard before insert or update on checklist_items
+  for each row execute function enforce_parent_owner('trips','topic_id','topic_id','0');
+create trigger budget_items_parent_guard    before insert or update on budget_items
+  for each row execute function enforce_parent_owner('trips','topic_id','topic_id','0');
+
+-- ============================================================================
+-- Storage: bucket 'topic-files' (private เสมอ)
+-- path = {owner_id}/{topic_id}/{uuid}.{ext}
+-- ============================================================================
+
+insert into storage.buckets (id, name, public, file_size_limit)
+values ('topic-files', 'topic-files', false, 26214400)
+on conflict (id) do nothing;
+
+create policy topic_files_read on storage.objects
+  for select to authenticated
+  using (bucket_id = 'topic-files' and (storage.foldername(name))[1] = auth.uid()::text);
+
+create policy topic_files_insert on storage.objects
+  for insert to authenticated
+  with check (bucket_id = 'topic-files' and (storage.foldername(name))[1] = auth.uid()::text);
+
+create policy topic_files_delete on storage.objects
+  for delete to authenticated
+  using (bucket_id = 'topic-files' and (storage.foldername(name))[1] = auth.uid()::text);
+
+-- ============================================================================
+-- Grants — ระบุให้ชัดเจน ไม่ฝากความปลอดภัยไว้กับ default privileges ของ Supabase
+--
+-- ชั้นที่ 1: anon ไม่มีสิทธิ์แตะตารางใน public เลย (ต่อให้เผลอเพิ่ม policy ก็ยังเข้าไม่ได้)
+-- ชั้นที่ 2: authenticated มีสิทธิ์ระดับตาราง แต่ RLS เป็นตัวกรองว่าเห็นแถวไหน
+-- ============================================================================
+
+grant usage on schema public to authenticated;
+grant select, insert, update, delete on all tables in schema public to authenticated;
+
+revoke all on all tables in schema public from anon;
+
+-- ตารางที่จะถูกสร้างเพิ่มทีหลัง (0004+) ต้องได้สิทธิ์แบบเดียวกันโดยอัตโนมัติ
+-- ไม่งั้นตารางใหม่จะเข้าถึงไม่ได้ หรือแย่กว่านั้นคือเผลอเปิดให้ anon
+alter default privileges in schema public grant select, insert, update, delete on tables to authenticated;
+alter default privileges in schema public revoke all on tables from anon;
+```
 
 ### 5.3 Storage policy
 
@@ -657,6 +907,7 @@ score >= 4  และยัง is_travel_enabled = false  และยังไ�
 ```
 
 **กฎเหล็ก:**
+- **slug ต้องตรง `^[a-z0-9]{12,24}$` ที่ DB บังคับไว้** — `nanoid()` ค่าเริ่มต้นมีตัวพิมพ์ใหญ่กับ `-` `_` ซึ่งจะโดน CHECK constraint ตีกลับ ต้องใช้ `customAlphabet('0123456789abcdefghijklmnopqrstuvwxyz', 16)`
 - ไม่มี RLS policy ให้ `anon` แม้แต่ตัวเดียว → ต่อให้ anon key หลุด ก็ query อะไรไม่ได้
 - signed URL สร้างฝั่ง server **หลัง** ยืนยันว่า topic นั้น `is_public` แล้วเท่านั้น
 - `noindex` ใน meta ของหน้า `/s/[slug]` — ลิงก์แชร์ไม่ควรโผล่ Google
@@ -838,7 +1089,7 @@ rueang/
 | P4-4 | Export เรื่องเป็น Markdown + zip ไฟล์แนบ |
 | P4-5 | Service Worker: cache หน้า/รูปที่เคยเปิด → เปิดดูแผนตอนเน็ตไม่ดีได้ |
 | P4-6 | Share Target แบบ POST + รับไฟล์ (§6.4) |
-| P4-7 | ถังขยะ: กู้เรื่อง/entry ที่ soft delete ภายใน 30 วัน + cron ลบจริง |
+| P4-7 | ถังขยะ: กู้เรื่อง/entry ที่ soft delete ภายใน 30 วัน + cron ลบจริง — **ตอนลบจริงต้องลบ object ใน Storage ด้วย** (`on delete cascade` ลบแค่แถว `attachments` ไม่ได้แตะไฟล์ → ไม่ทำ = ไฟล์ค้างกินโควตาถาวร) |
 | P4-8 | รอบขัดเงา: a11y (contrast, focus ring, screen reader), Lighthouse ≥ 90 ทุกหมวด |
 
 **DoD:**

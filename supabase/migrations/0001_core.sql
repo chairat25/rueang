@@ -96,7 +96,6 @@ create table entries (
 
   title      text check (title is null or char_length(title) <= 300),
   body       text check (body  is null or char_length(body)  <= 20000),
-  sort_order double precision not null default 0,
 
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
@@ -174,14 +173,26 @@ create index attachments_topic_idx on attachments (topic_id);
 create or replace function sync_topic_entry_stats() returns trigger
 language plpgsql security definer set search_path = public as $$
 declare
-  tid uuid := coalesce(new.topic_id, old.topic_id);
+  touched  uuid[] := '{}';
+  distinct_ids uuid[];
+  tid uuid;
 begin
-  update topics t
-     set entry_count   = (select count(*)          from entries e
-                           where e.topic_id = tid and e.deleted_at is null),
-         last_entry_at = (select max(e.created_at) from entries e
-                           where e.topic_id = tid and e.deleted_at is null)
-   where t.id = tid;
+  -- ต้องนับใหม่ "ทั้งเรื่องต้นทางและปลายทาง" ไม่งั้นตอนย้าย entry ข้ามเรื่อง
+  -- เรื่องเดิมจะค้างตัวเลขเก่าไว้ตลอดกาล
+  if TG_OP <> 'INSERT' then touched := touched || old.topic_id; end if;
+  if TG_OP <> 'DELETE' then touched := touched || new.topic_id; end if;
+
+  select array_agg(distinct v) into distinct_ids from unnest(touched) v;
+  if distinct_ids is null then return null; end if;
+
+  foreach tid in array distinct_ids loop
+    update topics t
+       set entry_count   = (select count(*)          from entries e
+                             where e.topic_id = tid and e.deleted_at is null),
+           last_entry_at = (select max(e.created_at) from entries e
+                             where e.topic_id = tid and e.deleted_at is null)
+     where t.id = tid;
+  end loop;
   return null;
 end $$;
 

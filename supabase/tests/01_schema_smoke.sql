@@ -78,3 +78,41 @@ select count(*) filter (where not rowsecurity) as tables_without_rls from pg_tab
 
 \echo '--- T16: ต้องไม่มี policy ให้ anon เลย'
 select count(*) as anon_policies from pg_policies where schemaname='public' and 'anon' = any(roles);
+
+\echo '--- T17: ย้าย entry ข้ามเรื่อง -> entry_count ต้องถูกทั้งเรื่องต้นทางและปลายทาง'
+insert into topics (id, owner_id, title) values
+  ('aaaaaaaa-0000-0000-0000-000000000002','11111111-1111-1111-1111-111111111111','เรื่องปลายทาง');
+insert into entries (id, topic_id, owner_id, body) values
+  ('cccccccc-0000-0000-0000-000000000002','aaaaaaaa-0000-0000-0000-000000000001',
+   '11111111-1111-1111-1111-111111111111','จะถูกย้าย');
+select title, entry_count from topics
+ where id in ('aaaaaaaa-0000-0000-0000-000000000001','aaaaaaaa-0000-0000-0000-000000000002') order by title;
+update entries set topic_id = 'aaaaaaaa-0000-0000-0000-000000000002'
+ where id = 'cccccccc-0000-0000-0000-000000000002';
+\echo '    หลังย้าย: ต้นทางต้องลด ปลายทางต้องเพิ่ม (ถ้าต้นทางไม่ลด = บั๊ก)'
+select title, entry_count from topics
+ where id in ('aaaaaaaa-0000-0000-0000-000000000001','aaaaaaaa-0000-0000-0000-000000000002') order by title;
+
+\echo '--- T18: แก้ trip_stop ได้ แม้ entry ต้นทางถูก soft-delete ไปแล้ว (ต้องสำเร็จ)'
+insert into entries (id, topic_id, owner_id, body) values
+  ('cccccccc-0000-0000-0000-000000000003','aaaaaaaa-0000-0000-0000-000000000001',
+   '11111111-1111-1111-1111-111111111111','ต้นทางของ stop');
+insert into trip_stops (id, topic_id, owner_id, entry_id, name) values
+  ('eeeeeeee-0000-0000-0000-000000000002','aaaaaaaa-0000-0000-0000-000000000001',
+   '11111111-1111-1111-1111-111111111111','cccccccc-0000-0000-0000-000000000003','จุดแวะ');
+update entries set deleted_at = now() where id = 'cccccccc-0000-0000-0000-000000000003';
+update trip_stops set name = 'จุดแวะ (แก้ชื่อ)' where id = 'eeeeeeee-0000-0000-0000-000000000002';
+select name from trip_stops where id = 'eeeeeeee-0000-0000-0000-000000000002';
+
+\echo '--- T19: ย้าย stop ไปหา entry ของคนอื่น = ต้อง FAIL (guard ยังทำงานตอน FK เปลี่ยน)'
+insert into entries (id, topic_id, owner_id, body) values
+  ('cccccccc-0000-0000-0000-000000000004','bbbbbbbb-0000-0000-0000-000000000001',
+   '22222222-2222-2222-2222-222222222222','ของ B');
+update trip_stops set entry_id = 'cccccccc-0000-0000-0000-000000000004'
+ where id = 'eeeeeeee-0000-0000-0000-000000000002';
+
+\echo '--- T20: soft-delete topic แล้ว soft-delete entry ตาม = ต้องสำเร็จ (cascade ของ app)'
+update topics  set deleted_at = now() where id = 'aaaaaaaa-0000-0000-0000-000000000002';
+update entries set deleted_at = now() where topic_id = 'aaaaaaaa-0000-0000-0000-000000000002';
+select count(*) as entries_soft_deleted from entries
+ where topic_id = 'aaaaaaaa-0000-0000-0000-000000000002' and deleted_at is not null;

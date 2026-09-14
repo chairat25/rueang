@@ -86,12 +86,23 @@ declare
   parent_pk      text := TG_ARGV[2];
   require_active boolean := TG_ARGV[3] = '1';
   fk_value uuid;
+  old_fk   uuid;
   extra_cond text := '';
   is_ok boolean;
 begin
   fk_value := (to_jsonb(new) ->> fk_column)::uuid;
   if fk_value is null then
     return new;                            -- FK ที่ nullable (เช่น day_id, entry_id)
+  end if;
+
+  -- ตรวจเฉพาะตอน "ตั้งค่า FK ใหม่" หรือ "ย้าย FK" เท่านั้น
+  -- ถ้าตรวจทุก UPDATE จะพังตอน soft-delete หรือแก้แถวที่ FK ชี้ไปหาของที่ถูก soft-delete ไปแล้ว
+  -- (เช่น แก้ชื่อ trip_stop หลังลบ entry ต้นทาง — ซึ่งดีไซน์ตั้งใจให้ทำได้)
+  if TG_OP = 'UPDATE' then
+    old_fk := (to_jsonb(old) ->> fk_column)::uuid;
+    if old_fk is not distinct from fk_value then
+      return new;
+    end if;
   end if;
 
   if require_active then
@@ -172,4 +183,8 @@ grant usage on schema public to authenticated;
 grant select, insert, update, delete on all tables in schema public to authenticated;
 
 revoke all on all tables in schema public from anon;
+
+-- ตารางที่จะถูกสร้างเพิ่มทีหลัง (0004+) ต้องได้สิทธิ์แบบเดียวกันโดยอัตโนมัติ
+-- ไม่งั้นตารางใหม่จะเข้าถึงไม่ได้ หรือแย่กว่านั้นคือเผลอเปิดให้ anon
+alter default privileges in schema public grant select, insert, update, delete on tables to authenticated;
 alter default privileges in schema public revoke all on tables from anon;

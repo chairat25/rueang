@@ -67,6 +67,9 @@ yarn build                      # ต้องผ่าน
 | C5 | mime type ตรวจจาก content ไม่ใช่แค่ชื่อไฟล์ | เปลี่ยนนามสกุล `.exe` → `.jpg` แล้วอัป ต้องถูกปฏิเสธ | 🟠 |
 | C6 | soft delete จริง | ลบ entry → แถวยังอยู่ `deleted_at` ไม่ null และ `select` ไม่เห็น | 🟠 |
 | C7 | counter ถูกต้อง | เพิ่ม 3 ลบ 1 → `entry_count = 2` | 🟠 |
+| C7b | **counter ถูกต้องตอนย้าย entry ข้ามเรื่อง** | ย้าย entry → เรื่องต้นทางต้องลด ไม่ใช่ค้างตัวเลขเก่า (เทส T17) | 🟠 |
+| C10 | `link_previews` เขียนผ่าน admin client เท่านั้น | `grep -rn "link_previews" features/ app/` → ทุกจุดที่เขียนต้องมาจาก `lib/supabase/admin.ts` | 🔴 |
+| C11 | slug/ค่าที่มี CHECK constraint สร้างได้จริง | `share_slug` ต้องเป็น `[a-z0-9]{12,24}` — nanoid ต้องใช้ custom alphabet | 🟠 |
 | C8 | ค้นหาไทยได้ | ค้น "คาเฟ่", "เชียงใหม่" เจอ | 🟠 |
 | C9 | signed URL หมดอายุจริง | อายุ ≤ 10 นาที และ URL ไม่ถูก cache ลง HTML แบบถาวร | 🟠 |
 

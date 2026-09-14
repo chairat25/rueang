@@ -42,6 +42,7 @@
 | H8 | ห้าม mutate object/array เดิม | ใช้ spread / `toSorted` / `map` คืนของใหม่เสมอ |
 | H9 | ห้ามให้ `features/travel/` ถูก import จาก core (`features/topics`, `features/entries`, `features/capture`) | kit อ้าง core ได้ core ห้ามอ้าง kit |
 | H10 | ห้าม `--force`, `git push -f`, ลบไฟล์ที่ไม่ได้สร้างเอง, หรือแก้ `implementplan.md` | แผนเปลี่ยนได้โดยเจ้าของโปรเจกต์เท่านั้น |
+| H11 | ห้าม insert/update `link_previews` ด้วย client ของผู้ใช้ — ต้องใช้ admin client เท่านั้น | ตารางนี้เป็น cache ที่ทุกคนใช้ร่วมกัน ถ้าผู้ใช้เขียนเองได้จะเกิด cache poisoning (และ RLS ก็จะตีกลับอยู่ดี — ดูเทส R9) |
 
 ---
 
@@ -73,6 +74,7 @@ export async function doSomething(input: unknown) {
   if (!user) return { ok: false, error: 'กรุณาเข้าสู่ระบบ' } as const;   // 3. เช็ค auth
 
   const { data, error } = await supabase.from('...')...;                // 4. ให้ RLS ทำงาน
+  // ⚠️ ข้อยกเว้นเดียว: link_previews ต้องเขียนผ่าน admin client (ดู H11)
   if (error) {
     console.error('[doSomething]', error);                              // 5. log จริงฝั่ง server
     return { ok: false, error: 'บันทึกไม่สำเร็จ ลองใหม่อีกครั้ง' } as const;
@@ -119,6 +121,7 @@ export async function doSomething(input: unknown) {
 ## 6. เมื่อไม่แน่ใจ
 
 - แผนขัดกันเอง / schema ดูผิด / ต้องตัดสินใจนอกแผน → **หยุด เขียนคำถามไว้ อย่าเดาแล้วเขียนต่อ**
+- ก่อนเชื่อว่า schema ทำงานยังไง ให้รัน `supabase/tests/` ดูจริง — สคริปต์นั้นรันผ่านแล้วและเป็นคำตอบที่เชื่อถือได้กว่าการอ่านโค้ดเดา
 - ห้ามขยายขอบเขตเอง — ของที่อยู่ใน "นอกขอบเขต" (`implementplan.md` §1.4) ห้ามทำแม้จะง่าย
 - Next.js 16 มี breaking changes จาก 15 (async `params`/`searchParams`, caching defaults)
   **ก่อนเขียน route/page ให้อ่าน `node_modules/next/dist/docs/` ก่อน** อย่าเขียนจากความจำ
